@@ -127,7 +127,13 @@ impl PyConnection {
                 0 => Some(0u32.into_pyobject(py).unwrap().into_any().unbind()),
                 1 => Some(0u32.into_pyobject(py).unwrap().into_any().unbind()),
                 2 => Some("".into_pyobject(py).unwrap().into_any().unbind()),
-                6 => Some("whiskers_native".into_pyobject(py).unwrap().into_any().unbind()),
+                6 => Some(
+                    "whiskers_native"
+                        .into_pyobject(py)
+                        .unwrap()
+                        .into_any()
+                        .unbind(),
+                ),
                 7 => Some("01.00.0000".into_pyobject(py).unwrap().into_any().unbind()),
                 13 => match self.inner.query_single_string("SELECT @@SERVERNAME") {
                     Ok(Some(s)) => Some(s.into_pyobject(py).unwrap().into_any().unbind()),
