@@ -455,6 +455,13 @@ impl TdsCursor {
         columnwise_params: &[Bound<'_, PyList>],
         row_count: usize,
     ) -> PyResult<i32> {
+        // Try batched INSERT VALUES approach for INSERT statements
+        if let Some(total) = self.try_batched_insert(sql, columnwise_params, row_count)? {
+            self._rowcount = total;
+            return Ok(0);
+        }
+
+        // Fallback: row-by-row execution
         let mut total_affected: i64 = 0;
         for row_idx in 0..row_count {
             let params: Vec<PyObject> = Python::with_gil(|_py| -> PyResult<Vec<PyObject>> {
@@ -477,6 +484,98 @@ impl TdsCursor {
         }
         self._rowcount = total_affected;
         Ok(0)
+    }
+
+    /// Try to batch INSERT ... VALUES (?, ?, ?) into
+    /// INSERT ... VALUES (v,v,v),(v,v,v),...  (up to 1000 rows per statement).
+    /// Returns Some(total_affected) on success, None if SQL doesn't match pattern.
+    fn try_batched_insert(
+        &mut self,
+        sql: &str,
+        columnwise_params: &[Bound<'_, PyList>],
+        row_count: usize,
+    ) -> PyResult<Option<i64>> {
+        // Parse: INSERT INTO ... VALUES (?, ?, ?)
+        let upper = sql.trim().to_uppercase();
+        if !upper.starts_with("INSERT ") {
+            return Ok(None);
+        }
+
+        // Find VALUES clause
+        let values_pos = match upper.find("VALUES") {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+
+        // Extract the prefix: "INSERT INTO table (cols) VALUES "
+        let prefix = &sql.trim()[..values_pos + 6]; // includes "VALUES"
+
+        // Count ? placeholders in the VALUES clause
+        let values_clause = &sql.trim()[values_pos + 6..];
+        let param_count = values_clause.chars().filter(|c| *c == '?').count();
+        if param_count == 0 || columnwise_params.len() != param_count {
+            return Ok(None);
+        }
+
+        // SQL Server limit: 1000 rows per INSERT VALUES
+        const BATCH_SIZE: usize = 1000;
+        let mut total_affected: i64 = 0;
+
+        Python::with_gil(|py| -> PyResult<()> {
+            let mut batch_start = 0;
+            while batch_start < row_count {
+                let batch_end = std::cmp::min(batch_start + BATCH_SIZE, row_count);
+                let batch_len = batch_end - batch_start;
+
+                // Build: INSERT INTO t (a,b,c) VALUES (v,v,v),(v,v,v),...
+                // Pre-estimate capacity
+                let mut batch_sql =
+                    String::with_capacity(prefix.len() + batch_len * (param_count * 12 + 4));
+                batch_sql.push_str(prefix);
+                batch_sql.push(' ');
+
+                for row_idx in batch_start..batch_end {
+                    if row_idx > batch_start {
+                        batch_sql.push(',');
+                    }
+                    batch_sql.push('(');
+                    for col_idx in 0..param_count {
+                        if col_idx > 0 {
+                            batch_sql.push(',');
+                        }
+                        let val = columnwise_params[col_idx].get_item(row_idx)?;
+                        let literal = py_to_sql_literal(py, &val)?;
+                        batch_sql.push_str(&literal);
+                    }
+                    batch_sql.push(')');
+                }
+
+                // Execute the batch
+                let tx_prefix = self.begin_transaction_if_needed()?;
+                let client = self.client.clone();
+
+                self.columns = None;
+                self.writer = None;
+                self.direct_rows = None;
+                self.direct_col_count = 0;
+                self.row_index = 0;
+                self._rowcount = -1;
+                self.pending.clear();
+
+                self.execute_direct(client, &batch_sql, tx_prefix)?;
+
+                if self._rowcount >= 0 {
+                    total_affected += self._rowcount;
+                } else {
+                    total_affected += batch_len as i64;
+                }
+
+                batch_start = batch_end;
+            }
+            Ok(())
+        })?;
+
+        Ok(Some(total_affected))
     }
 
     pub fn fetchone(&mut self, py: Python<'_>) -> PyResult<Option<Vec<PyObject>>> {
