@@ -70,11 +70,11 @@ impl NativeRow {
 
     fn __getattr__(&self, py: Python<'_>, name: &str) -> PyResult<PyObject> {
         let map = self.column_map.bind(py);
-        if let Ok(idx) = map.get_item(name) {
-            if !idx.is_none() {
-                let i: usize = idx.extract()?;
-                return self.values.bind(py).get_item(i).map(|o| o.unbind());
-            }
+        if let Ok(idx) = map.get_item(name)
+            && !idx.is_none()
+        {
+            let i: usize = idx.extract()?;
+            return self.values.bind(py).get_item(i).map(|o| o.unbind());
         }
         Err(pyo3::exceptions::PyAttributeError::new_err(format!(
             "Row has no attribute '{}'",
@@ -138,7 +138,7 @@ impl ParamInfo {
             column_size: 0,
             decimal_digits: 0,
             is_dae: false,
-            data_ptr: py.None().into(),
+            data_ptr: py.None(),
         }
     }
 }
@@ -376,9 +376,9 @@ fn ddbc_sql_fetch_all_native(
 
     if has_direct {
         let direct_rows = stmt.cursor.direct_rows().as_ref().unwrap();
-        for i in start..total {
+        for direct_row in direct_rows.iter().skip(start) {
             let row = NativeRow {
-                values: direct_rows[i].clone_ref(py),
+                values: direct_row.clone_ref(py),
                 column_map: column_map.clone_ref(py),
                 cursor_ref: cursor_ref.clone_ref(py),
             };
@@ -487,25 +487,25 @@ fn ddbc_sql_columns(
     column: Option<&str>,
 ) -> PyResult<i32> {
     let mut conditions = Vec::new();
-    if let Some(c) = catalog {
-        if !c.is_empty() {
-            conditions.push(format!("c.TABLE_CATALOG = N'{}'", escape_sql(c)));
-        }
+    if let Some(c) = catalog
+        && !c.is_empty()
+    {
+        conditions.push(format!("c.TABLE_CATALOG = N'{}'", escape_sql(c)));
     }
-    if let Some(s) = schema {
-        if !s.is_empty() {
-            conditions.push(format!("c.TABLE_SCHEMA LIKE N'{}'", escape_sql(s)));
-        }
+    if let Some(s) = schema
+        && !s.is_empty()
+    {
+        conditions.push(format!("c.TABLE_SCHEMA LIKE N'{}'", escape_sql(s)));
     }
-    if let Some(t) = table {
-        if !t.is_empty() {
-            conditions.push(format!("c.TABLE_NAME LIKE N'{}'", escape_sql(t)));
-        }
+    if let Some(t) = table
+        && !t.is_empty()
+    {
+        conditions.push(format!("c.TABLE_NAME LIKE N'{}'", escape_sql(t)));
     }
-    if let Some(col) = column {
-        if !col.is_empty() {
-            conditions.push(format!("c.COLUMN_NAME LIKE N'{}'", escape_sql(col)));
-        }
+    if let Some(col) = column
+        && !col.is_empty()
+    {
+        conditions.push(format!("c.COLUMN_NAME LIKE N'{}'", escape_sql(col)));
     }
     let where_clause = if conditions.is_empty() {
         String::new()
@@ -572,15 +572,15 @@ fn ddbc_sql_primary_keys(
     table: &str,
 ) -> PyResult<i32> {
     let mut conditions = vec!["tc.CONSTRAINT_TYPE = 'PRIMARY KEY'".to_string()];
-    if let Some(c) = catalog {
-        if !c.is_empty() {
-            conditions.push(format!("tc.TABLE_CATALOG = N'{}'", escape_sql(c)));
-        }
+    if let Some(c) = catalog
+        && !c.is_empty()
+    {
+        conditions.push(format!("tc.TABLE_CATALOG = N'{}'", escape_sql(c)));
     }
-    if let Some(s) = schema {
-        if !s.is_empty() {
-            conditions.push(format!("tc.TABLE_SCHEMA = N'{}'", escape_sql(s)));
-        }
+    if let Some(s) = schema
+        && !s.is_empty()
+    {
+        conditions.push(format!("tc.TABLE_SCHEMA = N'{}'", escape_sql(s)));
     }
     if !table.is_empty() {
         conditions.push(format!("tc.TABLE_NAME = N'{}'", escape_sql(table)));
@@ -610,35 +610,35 @@ fn ddbc_sql_foreign_keys(
     pk_table: Option<&str>,
 ) -> PyResult<i32> {
     let mut conditions = Vec::new();
-    if let Some(c) = fk_catalog {
-        if !c.is_empty() {
-            conditions.push(format!("pk_kcu.TABLE_CATALOG = N'{}'", escape_sql(c)));
-        }
+    if let Some(c) = fk_catalog
+        && !c.is_empty()
+    {
+        conditions.push(format!("pk_kcu.TABLE_CATALOG = N'{}'", escape_sql(c)));
     }
-    if let Some(s) = fk_schema {
-        if !s.is_empty() {
-            conditions.push(format!("pk_kcu.TABLE_SCHEMA = N'{}'", escape_sql(s)));
-        }
+    if let Some(s) = fk_schema
+        && !s.is_empty()
+    {
+        conditions.push(format!("pk_kcu.TABLE_SCHEMA = N'{}'", escape_sql(s)));
     }
-    if let Some(t) = fk_table {
-        if !t.is_empty() {
-            conditions.push(format!("pk_kcu.TABLE_NAME = N'{}'", escape_sql(t)));
-        }
+    if let Some(t) = fk_table
+        && !t.is_empty()
+    {
+        conditions.push(format!("pk_kcu.TABLE_NAME = N'{}'", escape_sql(t)));
     }
-    if let Some(c) = pk_catalog {
-        if !c.is_empty() {
-            conditions.push(format!("fk_kcu.TABLE_CATALOG = N'{}'", escape_sql(c)));
-        }
+    if let Some(c) = pk_catalog
+        && !c.is_empty()
+    {
+        conditions.push(format!("fk_kcu.TABLE_CATALOG = N'{}'", escape_sql(c)));
     }
-    if let Some(s) = pk_schema {
-        if !s.is_empty() {
-            conditions.push(format!("fk_kcu.TABLE_SCHEMA = N'{}'", escape_sql(s)));
-        }
+    if let Some(s) = pk_schema
+        && !s.is_empty()
+    {
+        conditions.push(format!("fk_kcu.TABLE_SCHEMA = N'{}'", escape_sql(s)));
     }
-    if let Some(t) = pk_table {
-        if !t.is_empty() {
-            conditions.push(format!("fk_kcu.TABLE_NAME = N'{}'", escape_sql(t)));
-        }
+    if let Some(t) = pk_table
+        && !t.is_empty()
+    {
+        conditions.push(format!("fk_kcu.TABLE_NAME = N'{}'", escape_sql(t)));
     }
     let where_clause = if conditions.is_empty() {
         String::new()
@@ -678,15 +678,15 @@ fn ddbc_sql_statistics(
     _reserved: i32,
 ) -> PyResult<i32> {
     let mut conditions = Vec::new();
-    if let Some(c) = catalog {
-        if !c.is_empty() {
-            conditions.push(format!("DB_NAME() = N'{}'", escape_sql(c)));
-        }
+    if let Some(c) = catalog
+        && !c.is_empty()
+    {
+        conditions.push(format!("DB_NAME() = N'{}'", escape_sql(c)));
     }
-    if let Some(s) = schema {
-        if !s.is_empty() {
-            conditions.push(format!("s.name = N'{}'", escape_sql(s)));
-        }
+    if let Some(s) = schema
+        && !s.is_empty()
+    {
+        conditions.push(format!("s.name = N'{}'", escape_sql(s)));
     }
     if !table.is_empty() {
         conditions.push(format!("t.name = N'{}'", escape_sql(table)));
@@ -731,20 +731,20 @@ fn ddbc_sql_procedures(
     procedure: Option<&str>,
 ) -> PyResult<i32> {
     let mut conditions = Vec::new();
-    if let Some(c) = catalog {
-        if !c.is_empty() {
-            conditions.push(format!("ROUTINE_CATALOG = N'{}'", escape_sql(c)));
-        }
+    if let Some(c) = catalog
+        && !c.is_empty()
+    {
+        conditions.push(format!("ROUTINE_CATALOG = N'{}'", escape_sql(c)));
     }
-    if let Some(s) = schema {
-        if !s.is_empty() {
-            conditions.push(format!("ROUTINE_SCHEMA LIKE N'{}'", escape_sql(s)));
-        }
+    if let Some(s) = schema
+        && !s.is_empty()
+    {
+        conditions.push(format!("ROUTINE_SCHEMA LIKE N'{}'", escape_sql(s)));
     }
-    if let Some(p) = procedure {
-        if !p.is_empty() {
-            conditions.push(format!("ROUTINE_NAME LIKE N'{}'", escape_sql(p)));
-        }
+    if let Some(p) = procedure
+        && !p.is_empty()
+    {
+        conditions.push(format!("ROUTINE_NAME LIKE N'{}'", escape_sql(p)));
     }
     let where_clause = if conditions.is_empty() {
         String::new()
@@ -781,15 +781,15 @@ fn ddbc_sql_special_columns(
     }
 
     let mut conditions = Vec::new();
-    if let Some(c) = catalog {
-        if !c.is_empty() {
-            conditions.push(format!("DB_NAME() = N'{}'", escape_sql(c)));
-        }
+    if let Some(c) = catalog
+        && !c.is_empty()
+    {
+        conditions.push(format!("DB_NAME() = N'{}'", escape_sql(c)));
     }
-    if let Some(s) = schema {
-        if !s.is_empty() {
-            conditions.push(format!("s.name = N'{}'", escape_sql(s)));
-        }
+    if let Some(s) = schema
+        && !s.is_empty()
+    {
+        conditions.push(format!("s.name = N'{}'", escape_sql(s)));
     }
     if !table.is_empty() {
         conditions.push(format!("t.name = N'{}'", escape_sql(table)));

@@ -201,16 +201,10 @@ impl TdsCursor {
                         let next_infos: Vec<ColumnInfo> =
                             next_cols.iter().map(TdsCursor::column_to_info).collect();
                         let mut rw = PyRowWriter::new(next_cols.len());
-                        loop {
-                            match c
-                                .batch_fetch_row(&mut rw, &mut string_buf, &mut bytes_buf)
-                                .map_err(to_pyerr)?
-                            {
-                                tabby::BatchFetchResult::Row => {}
-                                tabby::BatchFetchResult::MoreResults
-                                | tabby::BatchFetchResult::Done(_) => break,
-                            }
-                        }
+                        while let tabby::BatchFetchResult::Row = c
+                            .batch_fetch_row(&mut rw, &mut string_buf, &mut bytes_buf)
+                            .map_err(to_pyerr)?
+                        {}
                         extra_sets.push((next_infos, rw));
                     }
                 }
@@ -303,10 +297,10 @@ impl TdsCursor {
             }
 
             if check_rowcount && cols.len() == 1 && cols[0].name == "__rowcount__" {
-                if writer.row_count() > 0 {
-                    if let CompactValue::I64(v) = writer.get(0, 0) {
-                        rowcount_from_batch = Some(*v);
-                    }
+                if writer.row_count() > 0
+                    && let CompactValue::I64(v) = writer.get(0, 0)
+                {
+                    rowcount_from_batch = Some(*v);
                 }
                 continue;
             }
@@ -412,14 +406,14 @@ impl TdsCursor {
                         VarLenType::Daten => 10,
                         VarLenType::Timen => 8 + ctx.len() as i64,
                         VarLenType::Datetime2 => {
-                            19 + if ctx.len() > 0 {
+                            19 + if !ctx.is_empty() {
                                 1 + ctx.len() as i64
                             } else {
                                 0
                             }
                         }
                         VarLenType::DatetimeOffsetn => {
-                            26 + if ctx.len() > 0 {
+                            26 + if !ctx.is_empty() {
                                 1 + ctx.len() as i64
                             } else {
                                 0
@@ -507,12 +501,12 @@ impl TdsCursor {
             return Ok(None);
         }
 
-        if let Some(ref writer) = self.writer {
-            if self.row_index < writer.row_count() {
-                let row = self.row_to_py(py, self.row_index)?;
-                self.row_index += 1;
-                return Ok(Some(row));
-            }
+        if let Some(ref writer) = self.writer
+            && self.row_index < writer.row_count()
+        {
+            let row = self.row_to_py(py, self.row_index)?;
+            self.row_index += 1;
+            return Ok(Some(row));
         }
         Ok(None)
     }
@@ -560,9 +554,9 @@ impl TdsCursor {
         // Fast path: pre-built row tuples (from DirectPyWriter)
         if let Some(ref rows) = self.direct_rows {
             let total = rows.len();
-            for i in self.row_index..total {
+            for row in rows.iter().skip(self.row_index) {
                 unsafe {
-                    pyo3::ffi::PyList_Append(rows_data.as_ptr(), rows[i].as_ptr());
+                    pyo3::ffi::PyList_Append(rows_data.as_ptr(), row.as_ptr());
                 }
             }
             self.row_index = total;

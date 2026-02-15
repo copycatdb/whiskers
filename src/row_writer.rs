@@ -301,6 +301,12 @@ pub struct MultiSetWriter {
     current: Option<PyRowWriter>,
 }
 
+impl Default for MultiSetWriter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MultiSetWriter {
     pub fn new() -> Self {
         Self {

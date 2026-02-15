@@ -197,10 +197,10 @@ impl TdsConnection {
                 drop(c);
                 let result_sets = msw.finalize();
                 for (_, writer) in &result_sets {
-                    if writer.row_count() > 0 {
-                        if let CompactValue::Str(val) = writer.get(0, 0) {
-                            return Ok(Some(val.clone()));
-                        }
+                    if writer.row_count() > 0
+                        && let CompactValue::Str(val) = writer.get(0, 0)
+                    {
+                        return Ok(Some(val.clone()));
                     }
                 }
                 Ok(None)

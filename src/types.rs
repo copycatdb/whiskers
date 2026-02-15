@@ -179,7 +179,7 @@ pub fn sql_value_to_py(py: Python<'_>, data: &SqlValue<'static>) -> PyResult<PyO
             let t = dt.time();
             let base = NaiveDate::from_ymd_opt(1, 1, 1).unwrap();
             let date = base + chrono::Duration::days(d.days() as i64);
-            let nanos = t.increments() as u64 * 10u64.pow(9 - t.scale() as u32);
+            let nanos = t.increments() * 10u64.pow(9 - t.scale() as u32);
             let secs = (nanos / 1_000_000_000) as u32;
             let remaining_nanos = (nanos % 1_000_000_000) as u32;
             let micros = remaining_nanos / 1000;
@@ -216,7 +216,7 @@ pub fn sql_value_to_py(py: Python<'_>, data: &SqlValue<'static>) -> PyResult<PyO
         }
 
         SqlValue::Time(Some(t)) => {
-            let nanos = t.increments() as u64 * 10u64.pow(9 - t.scale() as u32);
+            let nanos = t.increments() * 10u64.pow(9 - t.scale() as u32);
             let secs = (nanos / 1_000_000_000) as u32;
             let remaining_nanos = (nanos % 1_000_000_000) as u32;
             let micros = remaining_nanos / 1000;
@@ -237,7 +237,7 @@ pub fn sql_value_to_py(py: Python<'_>, data: &SqlValue<'static>) -> PyResult<PyO
             let t = dto.datetime2().time();
             let base = NaiveDate::from_ymd_opt(1, 1, 1).unwrap();
             let date = base + chrono::Duration::days(d.days() as i64);
-            let nanos = t.increments() as u64 * 10u64.pow(9 - t.scale() as u32);
+            let nanos = t.increments() * 10u64.pow(9 - t.scale() as u32);
             let secs = (nanos / 1_000_000_000) as u32;
             let remaining_nanos = (nanos % 1_000_000_000) as u32;
             let micros = remaining_nanos / 1000;
@@ -603,14 +603,14 @@ fn datetime_to_literal(_py: Python<'_>, param: &Bound<'_, PyAny>) -> PyResult<St
     }
 
     if microsecond > 0 {
-        if microsecond % 1000 == 0 {
+        if microsecond.is_multiple_of(1000) {
             let millis = microsecond / 1000;
-            return Ok(format!(
+            Ok(format!(
                 "'{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}'",
                 year, month, day, hour, minute, second, millis
-            ));
+            ))
         } else {
-            return Ok(format!(
+            Ok(format!(
                 "CAST('{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:07}' AS DATETIME2(7))",
                 year,
                 month,
@@ -619,7 +619,7 @@ fn datetime_to_literal(_py: Python<'_>, param: &Bound<'_, PyAny>) -> PyResult<St
                 minute,
                 second,
                 microsecond * 10
-            ));
+            ))
         }
     } else {
         Ok(format!(
