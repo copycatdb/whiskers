@@ -448,7 +448,11 @@ def main():
     for name, _ in DRIVERS:
         print(f"  {name}: {wins[name]}")
 
-    print("\nCleaning up...")
+    print("\nNote: These numbers are relative, not absolute. Results vary by")
+    print("hardware, OS, SQL Server version, and CI runner specs.")
+    print("Use for directional comparison only.\n")
+
+    print("Cleaning up...")
     cleanup()
     print("Done.")
 
