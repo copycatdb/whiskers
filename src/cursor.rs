@@ -3,7 +3,7 @@ use pyo3::types::PyList;
 
 use crate::connection::SharedClient;
 use crate::errors::to_pyerr;
-use crate::row_writer::{CompactValue, DirectPyWriter, PyRowWriter};
+use crate::row_writer::{CompactValue, PyRowWriter};
 use crate::types::{column_type_to_sql_type, compact_value_to_py, py_to_sql_literal};
 use std::sync::{Arc, Mutex};
 
@@ -166,7 +166,7 @@ impl TdsCursor {
 
                 if columns.is_empty() {
                     let _ = c.batch_drain();
-                    return Ok(None);
+                    return Ok::<_, PyErr>(None);
                 }
 
                 let col_infos: Vec<ColumnInfo> =
@@ -253,7 +253,10 @@ impl TdsCursor {
                 if check_rowcount && infos.len() == 1 && infos[0].name == "__rowcount__" {
                     continue;
                 }
-                pending.push(ResultSet { columns: infos, writer: rw });
+                pending.push(ResultSet {
+                    columns: infos,
+                    writer: rw,
+                });
             }
             if !pending.is_empty() {
                 let first = pending.remove(0);
@@ -275,7 +278,10 @@ impl TdsCursor {
 
         self.pending = extra_sets
             .into_iter()
-            .map(|(infos, rw)| ResultSet { columns: infos, writer: rw })
+            .map(|(infos, rw)| ResultSet {
+                columns: infos,
+                writer: rw,
+            })
             .collect();
         self.messages.clear();
 
