@@ -202,7 +202,7 @@ def make_stored_proc(cf):
     def fn():
         c = cf()
         cur = c.cursor()
-        cur.execute("{CALL perfbenchmark_stored_procedure}")
+        cur.execute("EXEC perfbenchmark_stored_procedure")
         cur.fetchall()
         cur.close()
         c.close()
