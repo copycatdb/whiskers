@@ -315,6 +315,9 @@ pub fn compact_value_to_py(py: Python<'_>, val: &CompactValue) -> PyResult<PyObj
                 return datetimeoffset_to_py(py, *micros, *offset_minutes);
             }
         };
+        if ptr.is_null() {
+            return Err(pyo3::PyErr::fetch(py));
+        }
         Ok(PyObject::from_owned_ptr(py, ptr))
     }
 }
