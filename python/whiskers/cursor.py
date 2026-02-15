@@ -1732,7 +1732,10 @@ class Cursor:
             
             # Create and return a Row object, passing column name map if available
             column_map = getattr(self, '_column_name_map', None)
-            return Row(self, self.description, row_data, column_map)
+            row = Row(self, self.description, row_data, column_map)
+            if hasattr(self.connection, '_output_converters') and self.connection._output_converters:
+                row._apply_output_converters(self, self.description)
+            return row
         except Exception as e:
             # On error, don't increment rownumber - rethrow the error
             raise e
@@ -1781,7 +1784,13 @@ class Cursor:
             
             # Convert raw data to Row objects
             column_map = getattr(self, '_column_name_map', None)
-            return [Row(self, self.description, row_data, column_map) for row_data in rows_data]
+            desc = self.description
+            has_converters = hasattr(self.connection, '_output_converters') and self.connection._output_converters
+            rows = [Row(self, desc, row_data, column_map) for row_data in rows_data]
+            if has_converters:
+                for row in rows:
+                    row._apply_output_converters(self, desc)
+            return rows
         except Exception as e:
             # On error, don't increment rownumber - rethrow the error
             raise e
@@ -1800,6 +1809,30 @@ class Cursor:
         # Fetch raw data
         rows_data = []
         try:
+            # Fast path: use NativeRow objects built entirely in Rust
+            has_converters = hasattr(self.connection, '_output_converters') and self.connection._output_converters
+            if not has_converters and hasattr(ddbc_bindings, 'DDBCSQLFetchAllNative'):
+                column_map = getattr(self, '_column_name_map', None)
+                if column_map is None and self.description:
+                    column_map = {d[0]: i for i, d in enumerate(self.description)}
+                    self._column_name_map = column_map
+                rows = ddbc_bindings.DDBCSQLFetchAllNative(self.hstmt, column_map or {}, self)
+
+                if self.hstmt:
+                    self.messages.extend(ddbc_bindings.DDBCSQLGetAllDiagRecords(self.hstmt))
+
+                if rows and self._has_result_set:
+                    self._next_row_index += len(rows)
+                    self._rownumber = self._next_row_index - 1
+
+                if len(rows) == 0 and self._next_row_index == 0:
+                    self.rowcount = 0
+                else:
+                    self.rowcount = self._next_row_index
+
+                return rows
+
+            # Fallback: use Python Row objects
             ret = ddbc_bindings.DDBCSQLFetchAll(self.hstmt, rows_data)
 
             if self.hstmt:
@@ -1819,7 +1852,13 @@ class Cursor:
             
             # Convert raw data to Row objects
             column_map = getattr(self, '_column_name_map', None)
-            return [Row(self, self.description, row_data, column_map) for row_data in rows_data]
+            desc = self.description
+            has_converters = hasattr(self.connection, '_output_converters') and self.connection._output_converters
+            rows = [Row(self, desc, row_data, column_map) for row_data in rows_data]
+            if has_converters:
+                for row in rows:
+                    row._apply_output_converters(self, desc)
+            return rows
         except Exception as e:
             # On error, don't increment rownumber - rethrow the error
             raise e

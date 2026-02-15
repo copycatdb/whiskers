@@ -3,7 +3,7 @@ use pyo3::types::PyList;
 
 use crate::connection::SharedClient;
 use crate::errors::to_pyerr;
-use crate::row_writer::{CompactValue, MultiSetWriter, PyRowWriter};
+use crate::row_writer::{CompactValue, DirectPyWriter, PyRowWriter};
 use crate::types::{column_type_to_sql_type, compact_value_to_py, py_to_sql_literal};
 use std::sync::{Arc, Mutex};
 
@@ -51,6 +51,9 @@ pub struct TdsCursor {
     tx_state: SharedTxState,
     columns: Option<Vec<ColumnInfo>>,
     writer: Option<PyRowWriter>,
+    /// Direct row tuples — pre-built during TDS decode
+    direct_rows: Option<Vec<PyObject>>,
+    direct_col_count: usize,
     row_index: usize,
     _rowcount: i64,
     pending: Vec<ResultSet>,
@@ -64,6 +67,8 @@ impl TdsCursor {
             tx_state,
             columns: None,
             writer: None,
+            direct_rows: None,
+            direct_col_count: 0,
             row_index: 0,
             _rowcount: -1,
             pending: Vec::new(),
@@ -74,6 +79,7 @@ impl TdsCursor {
     pub fn close(&mut self) -> PyResult<()> {
         self.columns = None;
         self.writer = None;
+        self.direct_rows = None;
         self.pending.clear();
         Ok(())
     }
@@ -101,6 +107,8 @@ impl TdsCursor {
 
         self.columns = None;
         self.writer = None;
+        self.direct_rows = None;
+        self.direct_col_count = 0;
         self.row_index = 0;
         self._rowcount = -1;
         self.pending.clear();
@@ -108,8 +116,9 @@ impl TdsCursor {
         self.execute_direct(client, &final_sql, tx_prefix)
     }
 
-    /// Execute via batch_into: TDS wire bytes → RowWriter → CompactValue.
-    /// No SqlValue. No claw. Direct decode.
+    /// Two-phase execute:
+    /// Phase 1: TDS decode → CompactValues (GIL released for max throughput)
+    /// Phase 2: CompactValues → PyObject tuples (GIL held, raw CPython API)
     fn execute_direct(
         &mut self,
         client: SharedClient,
@@ -146,25 +155,134 @@ impl TdsCursor {
             batch_sql.push_str("\nSELECT @@ROWCOUNT AS __rowcount__");
         }
 
-        // batch_into: sends raw SQL, decodes TDS wire bytes directly into
-        // MultiSetWriter via RowWriter trait. No SqlValue created at any point.
-        let (result_sets, messages) = Python::with_gil(|py| {
+        // Phase 1: TDS decode → CompactValues (GIL released)
+        let decode_result = Python::with_gil(|py| {
             py.allow_threads(|| {
                 let mut c = client.lock().unwrap();
-                let mut msw = MultiSetWriter::new();
+                let mut string_buf = String::with_capacity(4096);
+                let mut bytes_buf = Vec::with_capacity(4096);
 
-                c.batch_into(&batch_sql, &mut msw).map_err(to_pyerr)?;
+                let columns = c.batch_start(&batch_sql).map_err(to_pyerr)?;
 
-                drop(c);
-                let messages = msw.messages.clone();
-                Ok::<_, PyErr>((msw.finalize(), messages))
+                if columns.is_empty() {
+                    let _ = c.batch_drain();
+                    return Ok(None);
+                }
+
+                let col_infos: Vec<ColumnInfo> =
+                    columns.iter().map(TdsCursor::column_to_info).collect();
+                let col_count = columns.len();
+
+                // First result set
+                let mut writer = PyRowWriter::new(col_count);
+                let mut has_more = false;
+                loop {
+                    match c
+                        .batch_fetch_row(&mut writer, &mut string_buf, &mut bytes_buf)
+                        .map_err(to_pyerr)?
+                    {
+                        tabby::BatchFetchResult::Row => {}
+                        tabby::BatchFetchResult::MoreResults => {
+                            has_more = true;
+                            break;
+                        }
+                        tabby::BatchFetchResult::Done(_) => break,
+                    }
+                }
+
+                // Additional result sets
+                let mut extra_sets = Vec::new();
+                if has_more {
+                    loop {
+                        let next_cols = c.batch_fetch_metadata().map_err(to_pyerr)?;
+                        if next_cols.is_empty() {
+                            break;
+                        }
+                        let next_infos: Vec<ColumnInfo> =
+                            next_cols.iter().map(TdsCursor::column_to_info).collect();
+                        let mut rw = PyRowWriter::new(next_cols.len());
+                        loop {
+                            match c
+                                .batch_fetch_row(&mut rw, &mut string_buf, &mut bytes_buf)
+                                .map_err(to_pyerr)?
+                            {
+                                tabby::BatchFetchResult::Row => {}
+                                tabby::BatchFetchResult::MoreResults
+                                | tabby::BatchFetchResult::Done(_) => break,
+                            }
+                        }
+                        extra_sets.push((next_infos, rw));
+                    }
+                }
+
+                Ok(Some((col_infos, col_count, writer, extra_sets)))
             })
         })?;
 
-        self.messages = messages;
-        self.process_results(result_sets, needs_rowcount && !skip_rowcount)
+        let Some((col_infos, col_count, writer, extra_sets)) = decode_result else {
+            self.columns = None;
+            self.writer = None;
+            self.direct_rows = None;
+            self._rowcount = 0;
+            self.row_index = 0;
+            self.pending.clear();
+            return Ok(0);
+        };
+
+        // Phase 2: CompactValues → PyObject tuples (GIL held, raw CPython API)
+        let check_rowcount = needs_rowcount && !skip_rowcount;
+        let row_count = writer.row_count();
+
+        // Check for __rowcount__
+        if check_rowcount && col_infos.len() == 1 && col_infos[0].name == "__rowcount__" {
+            if row_count > 0 {
+                if let CompactValue::I64(v) = writer.get(0, 0) {
+                    self._rowcount = *v;
+                }
+            } else {
+                self._rowcount = 0;
+            }
+            self.columns = None;
+            self.writer = None;
+            self.direct_rows = None;
+            self.row_index = 0;
+
+            // Process extra sets
+            let mut pending: Vec<ResultSet> = Vec::new();
+            for (infos, rw) in extra_sets {
+                if check_rowcount && infos.len() == 1 && infos[0].name == "__rowcount__" {
+                    continue;
+                }
+                pending.push(ResultSet { columns: infos, writer: rw });
+            }
+            if !pending.is_empty() {
+                let first = pending.remove(0);
+                self.columns = Some(first.columns);
+                self.writer = Some(first.writer);
+                self._rowcount = -1;
+            }
+            self.pending = pending;
+            return Ok(0);
+        }
+
+        // Store CompactValues — convert to PyObjects lazily in fetchall/fetchone
+        self.columns = Some(col_infos);
+        self.writer = Some(writer);
+        self.direct_rows = None;
+        self.direct_col_count = col_count;
+        self._rowcount = -1;
+        self.row_index = 0;
+
+        self.pending = extra_sets
+            .into_iter()
+            .map(|(infos, rw)| ResultSet { columns: infos, writer: rw })
+            .collect();
+        self.messages.clear();
+
+        Ok(0)
     }
 
+    #[allow(dead_code)]
     fn process_results(
         &mut self,
         results: Vec<(Vec<ColumnInfo>, PyRowWriter)>,
@@ -362,6 +480,27 @@ impl TdsCursor {
     }
 
     pub fn fetchone(&mut self, py: Python<'_>) -> PyResult<Option<Vec<PyObject>>> {
+        // Fast path: pre-built tuples
+        if let Some(ref rows) = self.direct_rows {
+            if self.row_index < rows.len() {
+                // Return the tuple's elements as a Vec for compatibility
+                let tuple = rows[self.row_index].bind(py);
+                let col_count = self.direct_col_count;
+                let mut row = Vec::with_capacity(col_count);
+                for c in 0..col_count {
+                    unsafe {
+                        let item =
+                            pyo3::ffi::PyTuple_GET_ITEM(tuple.as_ptr(), c as pyo3::ffi::Py_ssize_t);
+                        pyo3::ffi::Py_INCREF(item);
+                        row.push(PyObject::from_owned_ptr(py, item));
+                    }
+                }
+                self.row_index += 1;
+                return Ok(Some(row));
+            }
+            return Ok(None);
+        }
+
         if let Some(ref writer) = self.writer {
             if self.row_index < writer.row_count() {
                 let row = self.row_to_py(py, self.row_index)?;
@@ -384,26 +523,80 @@ impl TdsCursor {
     }
 
     pub fn fetchall(&mut self, py: Python<'_>) -> PyResult<Vec<Vec<PyObject>>> {
-        let total = self.writer.as_ref().map_or(0, |w| w.row_count());
+        let writer = match self.writer.as_ref() {
+            Some(w) => w,
+            None => return Ok(Vec::new()),
+        };
+        let total = writer.row_count();
         let remaining = total - self.row_index;
+        let col_count = writer.col_count;
+        let values = &writer.values;
         let mut result = Vec::with_capacity(remaining);
         for i in self.row_index..total {
-            result.push(self.row_to_py(py, i)?);
+            let base = i * col_count;
+            let mut py_row = Vec::with_capacity(col_count);
+            for c in 0..col_count {
+                py_row.push(compact_value_to_py(py, &values[base + c])?);
+            }
+            result.push(py_row);
         }
         self.row_index = total;
         Ok(result)
+    }
+
+    /// Optimized fetchall that writes directly into a PyList of PyLists,
+    /// avoiding intermediate Vec<Vec<PyObject>> allocation.
+    pub fn fetchall_into(
+        &mut self,
+        py: Python<'_>,
+        rows_data: &Bound<'_, pyo3::types::PyList>,
+    ) -> PyResult<()> {
+        // Fast path: pre-built row tuples (from DirectPyWriter)
+        if let Some(ref rows) = self.direct_rows {
+            let total = rows.len();
+            for i in self.row_index..total {
+                unsafe {
+                    pyo3::ffi::PyList_Append(rows_data.as_ptr(), rows[i].as_ptr());
+                }
+            }
+            self.row_index = total;
+            return Ok(());
+        }
+
+        // Fallback: CompactValue storage (multi-result-set pending sets)
+        let writer = match self.writer.as_ref() {
+            Some(w) => w,
+            None => return Ok(()),
+        };
+        let total = writer.row_count();
+        let col_count = writer.col_count;
+        let values = &writer.values;
+        for i in self.row_index..total {
+            let base = i * col_count;
+            let row_list = pyo3::types::PyList::new(
+                py,
+                (0..col_count)
+                    .map(|c| compact_value_to_py(py, &values[base + c]))
+                    .collect::<PyResult<Vec<_>>>()?,
+            )?;
+            rows_data.append(row_list)?;
+        }
+        self.row_index = total;
+        Ok(())
     }
 
     pub fn nextset(&mut self) -> PyResult<bool> {
         if self.pending.is_empty() {
             self.columns = None;
             self.writer = None;
+            self.direct_rows = None;
             self.row_index = 0;
             return Ok(false);
         }
         let next = self.pending.remove(0);
         self.columns = Some(next.columns);
         self.writer = Some(next.writer);
+        self.direct_rows = None;
         self.row_index = 0;
         self._rowcount = -1;
         Ok(true)
@@ -416,6 +609,9 @@ impl TdsCursor {
         self.columns.as_ref()
     }
     pub fn row_count_total(&self) -> usize {
+        if let Some(ref rows) = self.direct_rows {
+            return rows.len();
+        }
         self.writer.as_ref().map_or(0, |w| w.row_count())
     }
     pub fn current_row_index(&self) -> usize {
@@ -423,6 +619,26 @@ impl TdsCursor {
     }
     pub fn set_row_index(&mut self, idx: usize) {
         self.row_index = idx;
+    }
+
+    pub fn direct_rows(&self) -> &Option<Vec<PyObject>> {
+        &self.direct_rows
+    }
+
+    /// Build a PyTuple for a single row from CompactValue writer (fallback path)
+    pub fn row_to_py_tuple(&self, py: Python<'_>, row_idx: usize) -> PyResult<PyObject> {
+        let writer = self.writer.as_ref().unwrap();
+        let col_count = writer.col_count;
+        let values = &writer.values;
+        let base = row_idx * col_count;
+        unsafe {
+            let tuple = pyo3::ffi::PyTuple_New(col_count as pyo3::ffi::Py_ssize_t);
+            for c in 0..col_count {
+                let obj = compact_value_to_py(py, &values[base + c])?;
+                pyo3::ffi::PyTuple_SET_ITEM(tuple, c as pyo3::ffi::Py_ssize_t, obj.into_ptr());
+            }
+            Ok(PyObject::from_owned_ptr(py, tuple))
+        }
     }
     pub fn get_messages(&self) -> &[(String, String)] {
         &self.messages

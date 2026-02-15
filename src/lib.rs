@@ -1,4 +1,5 @@
 use pyo3::prelude::*;
+use pyo3::types::PyTuple;
 
 mod connection;
 mod cursor;
@@ -8,6 +9,79 @@ mod types;
 
 use connection::TdsConnection;
 use cursor::TdsCursor;
+
+/// Native Row object — much faster than Python Row class.
+/// Stores pre-built tuple of values and a shared column map.
+#[pyclass(name = "NativeRow")]
+pub struct NativeRow {
+    values: PyObject,     // PyTuple
+    column_map: PyObject, // PyDict (shared across all rows)
+    #[allow(dead_code)]
+    cursor_ref: PyObject,
+}
+
+#[pymethods]
+impl NativeRow {
+    fn __getitem__(&self, py: Python<'_>, index: isize) -> PyResult<PyObject> {
+        let tuple = self.values.bind(py);
+        let len = tuple.len()? as isize;
+        let idx = if index < 0 { len + index } else { index };
+        if idx < 0 || idx >= len {
+            return Err(pyo3::exceptions::PyIndexError::new_err(
+                "index out of range",
+            ));
+        }
+        Ok(tuple.get_item(idx as usize)?.unbind())
+    }
+
+    fn __len__(&self, py: Python<'_>) -> PyResult<usize> {
+        self.values.bind(py).len()
+    }
+
+    fn __iter__(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<PyObject> {
+        slf.values
+            .bind(py)
+            .call_method0("__iter__")
+            .map(|o| o.unbind())
+    }
+
+    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+        let s = self.values.bind(py).repr()?.to_string();
+        Ok(s)
+    }
+
+    fn __str__(&self, py: Python<'_>) -> PyResult<String> {
+        self.__repr__(py)
+    }
+
+    fn __eq__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<bool> {
+        let vals = self.values.bind(py);
+        if other.is_instance_of::<pyo3::types::PyList>() {
+            let other_tuple = PyTuple::new(py, other.try_iter()?.collect::<Result<Vec<_>, _>>()?)?;
+            vals.eq(other_tuple)
+        } else if let Ok(other_row) = other.downcast::<NativeRow>() {
+            let other_borrow = other_row.borrow();
+            let other_vals = other_borrow.values.bind(py);
+            vals.eq(other_vals)
+        } else {
+            vals.eq(other)
+        }
+    }
+
+    fn __getattr__(&self, py: Python<'_>, name: &str) -> PyResult<PyObject> {
+        let map = self.column_map.bind(py);
+        if let Ok(idx) = map.get_item(name) {
+            if !idx.is_none() {
+                let i: usize = idx.extract()?;
+                return self.values.bind(py).get_item(i).map(|o| o.unbind());
+            }
+        }
+        Err(pyo3::exceptions::PyAttributeError::new_err(format!(
+            "Row has no attribute '{}'",
+            name
+        )))
+    }
+}
 
 #[pyclass]
 #[derive(Clone)]
@@ -280,12 +354,49 @@ fn ddbc_sql_fetch_all(
     rows_data: &Bound<'_, pyo3::types::PyList>,
 ) -> PyResult<i32> {
     let py = rows_data.py();
-    let rows = stmt.cursor.fetchall(py)?;
-    for row in rows {
-        let py_list = pyo3::types::PyList::new(py, &row)?;
-        rows_data.append(py_list)?;
-    }
+    stmt.cursor.fetchall_into(py, rows_data)?;
     Ok(0)
+}
+
+/// Fast fetchall that returns NativeRow objects directly from Rust.
+/// Avoids Python-level Row.__init__ overhead entirely.
+#[pyfunction]
+#[pyo3(name = "DDBCSQLFetchAllNative")]
+fn ddbc_sql_fetch_all_native(
+    py: Python<'_>,
+    stmt: &mut StatementHandle,
+    column_map: PyObject,
+    #[allow(dead_code)] cursor_ref: PyObject,
+) -> PyResult<PyObject> {
+    let has_direct = stmt.cursor.direct_rows().is_some();
+    let total = stmt.cursor.row_count_total();
+    let start = stmt.cursor.current_row_index();
+    let count = total - start;
+    let mut result = Vec::with_capacity(count);
+
+    if has_direct {
+        let direct_rows = stmt.cursor.direct_rows().as_ref().unwrap();
+        for i in start..total {
+            let row = NativeRow {
+                values: direct_rows[i].clone_ref(py),
+                column_map: column_map.clone_ref(py),
+                cursor_ref: cursor_ref.clone_ref(py),
+            };
+            result.push(row.into_pyobject(py)?.into_any().unbind());
+        }
+    } else {
+        for i in start..total {
+            let py_row = stmt.cursor.row_to_py_tuple(py, i)?;
+            let row = NativeRow {
+                values: py_row,
+                column_map: column_map.clone_ref(py),
+                cursor_ref: cursor_ref.clone_ref(py),
+            };
+            result.push(row.into_pyobject(py)?.into_any().unbind());
+        }
+    }
+    stmt.cursor.set_row_index(total);
+    Ok(pyo3::types::PyList::new(py, &result)?.into_any().unbind())
 }
 
 #[pyfunction]
@@ -854,12 +965,14 @@ fn whiskers_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<StatementHandle>()?;
     m.add_class::<NumericData>()?;
     m.add_class::<ParamInfo>()?;
+    m.add_class::<NativeRow>()?;
     m.add_function(wrap_pyfunction!(ddbc_sql_execute, m)?)?;
     m.add_function(wrap_pyfunction!(ddbc_sql_row_count, m)?)?;
     m.add_function(wrap_pyfunction!(ddbc_sql_describe_col, m)?)?;
     m.add_function(wrap_pyfunction!(ddbc_sql_fetch_one, m)?)?;
     m.add_function(wrap_pyfunction!(ddbc_sql_fetch_many, m)?)?;
     m.add_function(wrap_pyfunction!(ddbc_sql_fetch_all, m)?)?;
+    m.add_function(wrap_pyfunction!(ddbc_sql_fetch_all_native, m)?)?;
     m.add_function(wrap_pyfunction!(ddbc_sql_more_results, m)?)?;
     m.add_function(wrap_pyfunction!(ddbc_sql_set_stmt_attr, m)?)?;
     m.add_function(wrap_pyfunction!(ddbc_sql_get_all_diag_records, m)?)?;

@@ -277,85 +277,129 @@ pub fn sql_value_to_py(py: Python<'_>, data: &SqlValue<'static>) -> PyResult<PyO
 /// This is the fast path — no SqlValue enum, pre-normalized temporal values.
 #[inline]
 pub fn compact_value_to_py(py: Python<'_>, val: &CompactValue) -> PyResult<PyObject> {
-    match val {
-        CompactValue::Null => Ok(py.None()),
-        CompactValue::Bool(v) => Ok(PyBool::new(py, *v).to_owned().into_any().unbind()),
-        CompactValue::I64(v) => Ok(v.into_pyobject(py)?.into_any().unbind()),
-        CompactValue::F64(v) => Ok(v.into_pyobject(py)?.into_any().unbind()),
-        CompactValue::Str(v) => Ok(PyString::new(py, v).into_any().unbind()),
-        CompactValue::Bytes(v) => Ok(PyBytes::new(py, v).into_any().unbind()),
-        CompactValue::Guid(bytes) => {
-            let u = uuid::Uuid::from_bytes(*bytes);
-            let s = u.to_string();
-            with_uuid_cls(py, |_py, cls| Ok(cls.call1((s,))?.unbind()))
-        }
-        CompactValue::Decimal(value, _precision, scale) => {
-            // Convert i128 + scale to string like "123.45"
-            let s = decimal_i128_to_string(*value, *scale);
-            with_decimal_cls(py, |_py, cls| Ok(cls.call1((s,))?.unbind()))
-        }
-        CompactValue::Date(unix_days) => {
-            // unix_days = days since Unix epoch (1970-01-01)
-            // Use same civil calendar algorithm
-            let days = *unix_days + 719468i32; // shift to 0000-03-01 epoch
-            let era = if days >= 0 { days } else { days - 146096 } / 146097;
-            let doe = (days - era * 146097) as u32;
-            let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-            let y = yoe as i32 + era * 400;
-            let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-            let mp = (5 * doy + 2) / 153;
-            let d = doy - (153 * mp + 2) / 5 + 1;
-            let m = if mp < 10 { mp + 3 } else { mp - 9 };
-            let year = if m <= 2 { y + 1 } else { y };
-            with_datetime(py, |_py, cache| {
-                Ok(cache.date_cls.bind(py).call1((year, m, d))?.unbind())
-            })
-        }
-        CompactValue::Time(nanos) => {
-            let total_secs = (*nanos / 1_000_000_000) as u32;
-            let remaining_nanos = (*nanos % 1_000_000_000) as u32;
-            let micros = remaining_nanos / 1000;
-            let hour = total_secs / 3600;
-            let minute = (total_secs % 3600) / 60;
-            let second = total_secs % 60;
-            with_datetime(py, |_py, cache| {
-                Ok(cache
-                    .time_cls
-                    .bind(py)
-                    .call1((hour, minute, second, micros))?
-                    .unbind())
-            })
-        }
-        CompactValue::DateTime(micros) => {
-            let (year, month, day, hour, minute, second, remaining_micros) =
-                micros_to_components(*micros);
-            with_datetime(py, |_py, cache| {
-                Ok(cache
-                    .datetime_cls
-                    .bind(py)
-                    .call1((year, month, day, hour, minute, second, remaining_micros))?
-                    .unbind())
-            })
-        }
-        CompactValue::DateTimeOffset(micros, offset_minutes) => {
-            let offset_micros = (*offset_minutes as i64) * 60 * 1_000_000;
-            let local_micros = micros + offset_micros;
-            let (year, month, day, hour, minute, second, remaining_micros) =
-                micros_to_components(local_micros);
-            with_datetime(py, |_py, cache| {
-                let td = cache
-                    .timedelta_cls
-                    .bind(py)
-                    .call1((0, *offset_minutes as i32 * 60))?;
-                let tz = cache.timezone_cls.bind(py).call1((td,))?;
-                Ok(cache
-                    .datetime_cls
-                    .bind(py)
-                    .call1((year, month, day, hour, minute, second, remaining_micros, tz))?
-                    .unbind())
-            })
-        }
+    unsafe {
+        let ptr = match val {
+            CompactValue::Null => {
+                let p = pyo3::ffi::Py_None();
+                pyo3::ffi::Py_IncRef(p);
+                p
+            }
+            CompactValue::Bool(v) => {
+                let p = if *v {
+                    pyo3::ffi::Py_True()
+                } else {
+                    pyo3::ffi::Py_False()
+                };
+                pyo3::ffi::Py_IncRef(p);
+                p
+            }
+            CompactValue::I64(v) => pyo3::ffi::PyLong_FromLongLong(*v as std::ffi::c_longlong),
+            CompactValue::F64(v) => pyo3::ffi::PyFloat_FromDouble(*v),
+            CompactValue::Str(v) => pyo3::ffi::PyUnicode_FromStringAndSize(
+                v.as_ptr() as *const std::ffi::c_char,
+                v.len() as pyo3::ffi::Py_ssize_t,
+            ),
+            CompactValue::Bytes(v) => pyo3::ffi::PyBytes_FromStringAndSize(
+                v.as_ptr() as *const std::ffi::c_char,
+                v.len() as pyo3::ffi::Py_ssize_t,
+            ),
+            // Complex types still go through safe PyO3 path
+            CompactValue::Guid(bytes) => return guid_to_py(py, bytes),
+            CompactValue::Decimal(value, precision, scale) => {
+                return decimal_to_py(py, *value, *precision, *scale);
+            }
+            CompactValue::Date(unix_days) => return date_days_to_py(py, *unix_days),
+            CompactValue::Time(nanos) => return time_nanos_to_py(py, *nanos),
+            CompactValue::DateTime(micros) => return datetime_micros_to_py(py, *micros),
+            CompactValue::DateTimeOffset(micros, offset_minutes) => {
+                return datetimeoffset_to_py(py, *micros, *offset_minutes);
+            }
+        };
+        Ok(PyObject::from_owned_ptr(py, ptr))
     }
+}
+
+#[inline]
+pub fn guid_to_py(py: Python<'_>, bytes: &[u8; 16]) -> PyResult<PyObject> {
+    let u = uuid::Uuid::from_bytes(*bytes);
+    let s = u.to_string();
+    with_uuid_cls(py, |_py, cls| Ok(cls.call1((s,))?.unbind()))
+}
+
+#[inline]
+pub fn decimal_to_py(py: Python<'_>, value: i128, _precision: u8, scale: u8) -> PyResult<PyObject> {
+    let s = decimal_i128_to_string(value, scale);
+    with_decimal_cls(py, |_py, cls| Ok(cls.call1((s,))?.unbind()))
+}
+
+#[inline]
+pub fn date_days_to_py(py: Python<'_>, unix_days: i32) -> PyResult<PyObject> {
+    let days = unix_days + 719468i32;
+    let era = if days >= 0 { days } else { days - 146096 } / 146097;
+    let doe = (days - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i32 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+    with_datetime(py, |_py, cache| {
+        Ok(cache.date_cls.bind(py).call1((year, m, d))?.unbind())
+    })
+}
+
+#[inline]
+pub fn time_nanos_to_py(py: Python<'_>, nanos: i64) -> PyResult<PyObject> {
+    let total_secs = (nanos / 1_000_000_000) as u32;
+    let remaining_nanos = (nanos % 1_000_000_000) as u32;
+    let micros = remaining_nanos / 1000;
+    let hour = total_secs / 3600;
+    let minute = (total_secs % 3600) / 60;
+    let second = total_secs % 60;
+    with_datetime(py, |_py, cache| {
+        Ok(cache
+            .time_cls
+            .bind(py)
+            .call1((hour, minute, second, micros))?
+            .unbind())
+    })
+}
+
+#[inline]
+pub fn datetime_micros_to_py(py: Python<'_>, micros: i64) -> PyResult<PyObject> {
+    let (year, month, day, hour, minute, second, remaining_micros) = micros_to_components(micros);
+    with_datetime(py, |_py, cache| {
+        Ok(cache
+            .datetime_cls
+            .bind(py)
+            .call1((year, month, day, hour, minute, second, remaining_micros))?
+            .unbind())
+    })
+}
+
+#[inline]
+pub fn datetimeoffset_to_py(
+    py: Python<'_>,
+    micros: i64,
+    offset_minutes: i16,
+) -> PyResult<PyObject> {
+    let offset_micros = (offset_minutes as i64) * 60 * 1_000_000;
+    let local_micros = micros + offset_micros;
+    let (year, month, day, hour, minute, second, remaining_micros) =
+        micros_to_components(local_micros);
+    with_datetime(py, |_py, cache| {
+        let td = cache
+            .timedelta_cls
+            .bind(py)
+            .call1((0, offset_minutes as i32 * 60))?;
+        let tz = cache.timezone_cls.bind(py).call1((td,))?;
+        Ok(cache
+            .datetime_cls
+            .bind(py)
+            .call1((year, month, day, hour, minute, second, remaining_micros, tz))?
+            .unbind())
+    })
 }
 
 /// Decompose microseconds since Unix epoch into (year, month, day, hour, min, sec, micros).
