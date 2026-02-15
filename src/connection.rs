@@ -1,15 +1,14 @@
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-use tabby::{AuthMethod, Client, Config, EncryptionLevel};
-use tokio::net::TcpStream;
-use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
+use std::net::TcpStream;
+use tabby::{AuthMethod, Config, EncryptionLevel, SyncClient};
 
 use crate::cursor::{SharedTxState, TdsCursor, TransactionState};
 use crate::errors::to_pyerr;
-use crate::runtime;
+use crate::row_writer::{CompactValue, MultiSetWriter};
 use std::sync::{Arc, Mutex};
 
-pub type SharedClient = Arc<Mutex<Client<Compat<TcpStream>>>>;
+pub type SharedClient = Arc<Mutex<SyncClient<TcpStream>>>;
 
 pub struct TdsConnection {
     client: Option<SharedClient>,
@@ -60,7 +59,7 @@ fn parse_connection_string(conn_str: &str) -> (String, u16, String, String, Stri
 
 impl TdsConnection {
     pub fn new(connection_str: &str, _attrs_before: Option<&Bound<'_, PyDict>>) -> PyResult<Self> {
-        let (host, port, database, uid, pwd, trust_cert) = parse_connection_string(connection_str);
+        let (host, port, database, uid, pwd, _trust_cert) = parse_connection_string(connection_str);
 
         // Check for required connection string parameters
         let has_server = connection_str.split(';').any(|part| {
@@ -79,42 +78,36 @@ impl TdsConnection {
 
         let client = Python::with_gil(|py| {
             py.allow_threads(|| {
-                runtime::block_on(async {
-                    let mut config = Config::new();
-                    config.host(&host);
-                    config.port(port);
-                    config.database(&database);
-                    config.authentication(AuthMethod::sql_server(&uid, &pwd));
-                    if trust_cert {
-                        config.trust_cert();
-                    }
-                    config.encryption(EncryptionLevel::Required);
+                let mut config = Config::new();
+                config.host(&host);
+                config.port(port);
+                config.database(&database);
+                config.authentication(AuthMethod::sql_server(&uid, &pwd));
+                config.trust_cert();
+                // SyncClient doesn't support TLS yet
+                config.encryption(EncryptionLevel::NotSupported);
 
-                    let tcp = TcpStream::connect(config.get_addr()).await.map_err(|e| {
-                        pyo3::exceptions::PyConnectionError::new_err(format!(
-                            "TCP connect failed: {}",
-                            e
-                        ))
-                    })?;
-                    tcp.set_nodelay(true).map_err(|e| {
-                        pyo3::exceptions::PyConnectionError::new_err(format!(
-                            "set_nodelay failed: {}",
-                            e
-                        ))
-                    })?;
+                let tcp = TcpStream::connect(config.get_addr()).map_err(|e| {
+                    pyo3::exceptions::PyConnectionError::new_err(format!(
+                        "TCP connect failed: {}",
+                        e
+                    ))
+                })?;
+                tcp.set_nodelay(true).map_err(|e| {
+                    pyo3::exceptions::PyConnectionError::new_err(format!(
+                        "set_nodelay failed: {}",
+                        e
+                    ))
+                })?;
 
-                    let client =
-                        Client::connect(config, tcp.compat_write())
-                            .await
-                            .map_err(|e| {
-                                pyo3::exceptions::PyConnectionError::new_err(format!(
-                                    "TDS connect failed: {}",
-                                    e
-                                ))
-                            })?;
+                let client = SyncClient::connect(config, tcp).map_err(|e| {
+                    pyo3::exceptions::PyConnectionError::new_err(format!(
+                        "TDS connect failed: {}",
+                        e
+                    ))
+                })?;
 
-                    Ok::<_, PyErr>(client)
-                })
+                Ok::<_, PyErr>(client)
             })
         })?;
 
@@ -143,16 +136,10 @@ impl TdsConnection {
         let sql = sql.to_string();
         Python::with_gil(|py| {
             py.allow_threads(|| {
-                runtime::block_on(async {
-                    let mut c = client.lock().unwrap();
-                    c.execute_raw(sql)
-                        .await
-                        .map_err(to_pyerr)?
-                        .into_results()
-                        .await
-                        .map_err(to_pyerr)?;
-                    Ok(())
-                })
+                let mut c = client.lock().unwrap();
+                let mut msw = MultiSetWriter::new();
+                c.batch_into(&sql, &mut msw).map_err(to_pyerr)?;
+                Ok(())
             })
         })
     }
@@ -204,25 +191,19 @@ impl TdsConnection {
         let sql = sql.to_string();
         Python::with_gil(|py| {
             py.allow_threads(|| {
-                runtime::block_on(async {
-                    let mut c = client.lock().unwrap();
-                    let results = c
-                        .execute_raw(sql)
-                        .await
-                        .map_err(to_pyerr)?
-                        .into_results()
-                        .await
-                        .map_err(to_pyerr)?;
-                    drop(c);
-                    for result_set in &results {
-                        for row in result_set {
-                            if let Some(val) = row.try_get::<&str, _>(0).map_err(to_pyerr)? {
-                                return Ok(Some(val.to_string()));
-                            }
+                let mut c = client.lock().unwrap();
+                let mut msw = MultiSetWriter::new();
+                c.batch_into(&sql, &mut msw).map_err(to_pyerr)?;
+                drop(c);
+                let result_sets = msw.finalize();
+                for (_, writer) in &result_sets {
+                    if writer.row_count() > 0 {
+                        if let CompactValue::Str(val) = writer.get(0, 0) {
+                            return Ok(Some(val.clone()));
                         }
                     }
-                    Ok(None)
-                })
+                }
+                Ok(None)
             })
         })
     }

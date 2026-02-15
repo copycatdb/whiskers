@@ -4,7 +4,6 @@ use pyo3::types::PyList;
 use crate::connection::SharedClient;
 use crate::errors::to_pyerr;
 use crate::row_writer::{CompactValue, MultiSetWriter, PyRowWriter};
-use crate::runtime;
 use crate::types::{column_type_to_sql_type, compact_value_to_py, py_to_sql_literal};
 use std::sync::{Arc, Mutex};
 
@@ -151,16 +150,14 @@ impl TdsCursor {
         // MultiSetWriter via RowWriter trait. No SqlValue created at any point.
         let (result_sets, messages) = Python::with_gil(|py| {
             py.allow_threads(|| {
-                runtime::block_on(async {
-                    let mut c = client.lock().unwrap();
-                    let mut msw = MultiSetWriter::new();
+                let mut c = client.lock().unwrap();
+                let mut msw = MultiSetWriter::new();
 
-                    c.batch_into(batch_sql, &mut msw).await.map_err(to_pyerr)?;
+                c.batch_into(&batch_sql, &mut msw).map_err(to_pyerr)?;
 
-                    drop(c);
-                    let messages = msw.messages.clone();
-                    Ok::<_, PyErr>((msw.finalize(), messages))
-                })
+                drop(c);
+                let messages = msw.messages.clone();
+                Ok::<_, PyErr>((msw.finalize(), messages))
             })
         })?;
 

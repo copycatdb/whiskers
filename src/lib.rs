@@ -4,7 +4,6 @@ mod connection;
 mod cursor;
 mod errors;
 pub mod row_writer;
-mod runtime;
 mod types;
 
 use connection::TdsConnection;
