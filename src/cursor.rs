@@ -539,11 +539,11 @@ impl TdsCursor {
                         batch_sql.push(',');
                     }
                     batch_sql.push('(');
-                    for col_idx in 0..param_count {
+                    for (col_idx, col) in columnwise_params.iter().enumerate() {
                         if col_idx > 0 {
                             batch_sql.push(',');
                         }
-                        let val = columnwise_params[col_idx].get_item(row_idx)?;
+                        let val = col.get_item(row_idx)?;
                         let literal = py_to_sql_literal(py, &val)?;
                         batch_sql.push_str(&literal);
                     }
